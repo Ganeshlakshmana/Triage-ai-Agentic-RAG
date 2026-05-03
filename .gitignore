@@ -1,33 +1,88 @@
-# secrets
+# =============================================================
+# Secrets & credentials  -- NEVER commit these
+# =============================================================
 .env
 .env.local
+.env.*.local
 *.pem
 *.key
+*.p12
+*.pfx
 
-# deps
-node_modules/
-.pnpm-store/
+# =============================================================
+# Python
+# =============================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
 .venv/
 venv/
-__pycache__/
-*.pyc
+env/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
-
-# build
+.hypothesis/
+*.egg-info/
 dist/
 build/
+*.egg
+pip-log.txt
+
+# =============================================================
+# Node / Frontend
+# =============================================================
+node_modules/
+.pnpm-store/
 *.tsbuildinfo
+.next/
+.nuxt/
+.output/
 
-# editor / os
-.DS_Store
-.idea/
-.vscode/
-Thumbs.db
+# =============================================================
+# Vector database & model caches
+# =============================================================
+# Qdrant local storage (if using embedded mode)
+qdrant_storage/
+# HuggingFace model cache (large binary files ~90MB+)
+.cache/
+~/.cache/huggingface/
 
-# local data / caches the participant may create
+# =============================================================
+# Output & generated files  -- reviewers run agent to produce these
+# =============================================================
+support_tickets/output.csv
+support_tickets/ingest_checkpoint.json
+
+# =============================================================
+# Local databases & indexes
+# =============================================================
 data/index/
 data/embeddings/
 *.sqlite
 *.db
+*.faiss
+*.index
+
+# =============================================================
+# Logs
+# =============================================================
+*.log
+logs/
+hackerrank_orchestrate/
+
+# =============================================================
+# OS / editor noise
+# =============================================================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
