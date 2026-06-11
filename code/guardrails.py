@@ -89,7 +89,7 @@ PROMPT_INJECTION_PATTERNS = [
 PII_PATTERNS = {
     "credit_card": r"\b(?:\d{4}[\s\-]?){3}\d{4}\b",
     "ssn": r"\b\d{3}[-\s]?\d{2}[-\s]?\d{4}\b",
-    "password": r"(password|passwd|pwd)\s*[:=\s]\s*\S+",
+    "password": r"\b(password|passwd|pwd)\s*(?:[:=]|\bis\b)\s*(?!(?:not|expired|incorrect|wrong|invalid|disabled|locked|changed|reset|blank|empty|short|weak|secure|required|hidden|saved|stored)\b)\S+",
     "api_key": r"(api[_\-]?key|apikey|secret[_\-]?key)\s*[:=]\s*[A-Za-z0-9\-_]{20,}",
     "bank_account": r"\b\d{8,17}\b(?=.*\b(account|routing|bank)\b)",
 }
@@ -369,6 +369,184 @@ def full_scan(
     # For warnings - generate a prefix to add to the response
     warning_prefix = get_pii_warning_prefix(result)
     return result, warning_prefix
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# LAYER 3 — Pre-Generation Confidence Scorer
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Why this layer?
+#   Before sending a ticket to any LLM, we estimate how likely we are to
+#   answer it well from our corpus. Vague, ambiguous, or very short tickets
+#   tend to produce low-quality responses. Scoring them early lets us:
+#     (a) set an appropriate confidence prior for the agent loop
+#     (b) trigger Layer 4 (stronger model routing) proactively
+#
+# Principle: Fail early, fail cheap.
+#   A 1-sentence ambiguous ticket costs the same Claude tokens as a detailed
+#   one — but is far less likely to be answered correctly. Layer 3 surfaces
+#   this before the expensive LLM call.
+
+# Signals that suggest a query is well-formed and answerable
+HIGH_CONFIDENCE_SIGNALS = [
+    r"\b(how (do|can|to)|what (is|are|happens)|where (do|can|is))\b",
+    r"\b(step[s]?|instruction[s]?|guide|tutorial|process)\b",
+    r"\b(hackerrank|claude|visa|anthropic|payment|card|interview|assessment)\b",
+    r"\b(account|billing|subscription|plan|support|error|bug|issue)\b",
+]
+
+# Signals that reduce confidence (vague, adversarial, or off-topic)
+LOW_CONFIDENCE_SIGNALS = [
+    r"^.{0,20}$",                           # Very short (< 20 chars)
+    r"\b(anything|everything|stuff|thing)\b",  # Vague terms
+    r"[!?]{3,}",                             # Excessive punctuation
+    r"\b(asap|immediately|right now|urgent|emergency)\b",  # Urgency without detail
+]
+
+
+def pre_generation_confidence_score(issue: str, subject: str = "") -> dict:
+    """
+    Layer 3: Score the confidence that we can answer this ticket well
+    from our support corpus, BEFORE sending it to any LLM.
+
+    Args:
+        issue   : Ticket body
+        subject : Subject line
+
+    Returns:
+        Dict with:
+          - score      : float 0.0–1.0 (1.0 = very likely answerable)
+          - level      : "high" | "medium" | "low"
+          - reason     : Human-readable explanation
+          - suggest_stronger_model : bool — True means route to better LLM (Layer 4)
+
+    Score calculation:
+        Starts at 0.5 (neutral baseline).
+        +0.1 per high-confidence signal found (max +0.4)
+        -0.1 per low-confidence signal found (min 0.0)
+        Length bonus: +0.05 if issue > 100 chars, +0.10 if > 250 chars
+    """
+    import re
+
+    combined = f"{subject} {issue}".lower()
+    score = 0.5  # Neutral baseline
+
+    # Positive signals
+    positive_hits = 0
+    for pattern in HIGH_CONFIDENCE_SIGNALS:
+        if re.search(pattern, combined, re.IGNORECASE):
+            positive_hits += 1
+    score += min(positive_hits * 0.1, 0.4)
+
+    # Negative signals
+    for pattern in LOW_CONFIDENCE_SIGNALS:
+        if re.search(pattern, combined, re.IGNORECASE):
+            score -= 0.1
+
+    # Length bonus
+    if len(issue) > 250:
+        score += 0.10
+    elif len(issue) > 100:
+        score += 0.05
+
+    # Clamp to [0.0, 1.0]
+    score = max(0.0, min(1.0, score))
+
+    # Categorize
+    if score >= 0.65:
+        level = "high"
+        reason = f"Query is specific and domain-relevant (score={score:.2f})"
+        suggest_stronger_model = False
+    elif score >= 0.40:
+        level = "medium"
+        reason = f"Query has moderate specificity (score={score:.2f})"
+        suggest_stronger_model = False
+    else:
+        level = "low"
+        reason = f"Query is vague or short — may need stronger model (score={score:.2f})"
+        suggest_stronger_model = True
+
+    return {
+        "score": round(score, 3),
+        "level": level,
+        "reason": reason,
+        "suggest_stronger_model": suggest_stronger_model,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# LAYER 4 — Multi-Provider Routing Gate
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Why this layer?
+#   Layer 3 gives us a confidence score. Layer 4 acts on it:
+#   - High confidence → use the default (fast) provider
+#   - Low confidence  → route to the strongest available provider
+#
+#   This is the "multi-provider routing" claim from the CV.
+#   It makes routing decisions safety-aware, not just cost-aware.
+#
+# Provider strength ranking (best for hard reasoning tasks):
+#   1. claude  — best instruction-following + JSON output
+#   2. openai  — strong general reasoning
+#   3. gemini  — good fallback, fast
+
+PROVIDER_STRENGTH_RANK = ["claude", "openai", "gemini"]
+
+
+def get_routed_provider(
+    confidence_result: dict,
+    requested_provider: str = "auto",
+) -> str:
+    """
+    Layer 4: Determine which LLM provider to use based on:
+      - The Layer 3 confidence score
+      - The user-requested provider preference
+
+    Args:
+        confidence_result   : Output of pre_generation_confidence_score()
+        requested_provider  : What the user/API explicitly requested
+
+    Returns:
+        Provider string: "claude", "openai", or "gemini"
+
+    Logic:
+        If confidence is "low" and user didn't fix a provider →
+          use the strongest available provider regardless of DEFAULT_PROVIDER.
+        Otherwise, respect the requested_provider or DEFAULT_PROVIDER.
+    """
+    from config import DEFAULT_PROVIDER, PROVIDER_FALLBACK_CHAIN, \
+        ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY
+
+    available = []
+    if ANTHROPIC_API_KEY:
+        available.append("claude")
+    if OPENAI_API_KEY:
+        available.append("openai")
+    if GEMINI_API_KEY:
+        available.append("gemini")
+
+    # If user explicitly selected a provider, always respect it
+    if requested_provider not in ("auto", "", None):
+        return requested_provider if requested_provider in available else (available[0] if available else "claude")
+
+    # Low confidence → upgrade to strongest available model
+    if confidence_result.get("suggest_stronger_model"):
+        for strong_provider in PROVIDER_STRENGTH_RANK:
+            if strong_provider in available:
+                return strong_provider
+
+    # Otherwise use default provider or first in chain
+    if DEFAULT_PROVIDER != "auto" and DEFAULT_PROVIDER in available:
+        return DEFAULT_PROVIDER
+
+    # Auto: return first in fallback chain
+    for p in PROVIDER_FALLBACK_CHAIN:
+        if p in available:
+            return p
+
+    return available[0] if available else "claude"
+
 
 
 # Quick Test
