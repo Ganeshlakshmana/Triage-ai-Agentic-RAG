@@ -29,6 +29,7 @@ Principle: The agent should know what it doesn't know.
 
 import json
 import re
+import sys
 import anthropic
 
 from config import ANTHROPIC_API_KEY, GENERATION_MODEL, TOP_K
@@ -39,11 +40,15 @@ from classifier import (
     infer_company,
     validate_and_fix_output,
 )
-from guardrails import full_scan, get_input_block_response, apply_output_guardrails
+from guardrails import (
+    full_scan, get_input_block_response, apply_output_guardrails,
+    pre_generation_confidence_score, get_routed_provider,
+)
 from tools import execute_tool, build_tools_prompt, ToolResult
 from cost_tracker import tracker
+from llm_router import LLMRouter, get_router
 
-# Initialize Claude Client
+# Initialize default Claude client (kept for cost_tracker compatibility)
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 # Agentic Loop Settings
@@ -156,6 +161,16 @@ def build_iteration_prompt(
         history_text += f"  Context preview: {h['context'][:300]}...\n"
         history_text += f"  {'-' * 40}\n"
 
+    last_iteration_warning = ""
+    if iteration == MAX_ITERATIONS:
+        last_iteration_warning = f"""
+!!! FINAL ITERATION WARNING !!!
+This is the final iteration ({iteration} of {MAX_ITERATIONS}).
+You MUST select "final_answer" to reply or escalate.
+Do NOT use search actions (search_company_docs, search_all_docs, search_refined) in this iteration, because the loop will terminate and you will never see the search results.
+You must output "final_answer" with your response and confidence. If you don't have enough information to answer, output "final_answer" with status "escalated" and a polite explanation.
+"""
+
     return f"""SUPPORT TICKET
 {'=' * 50}
 Company : {company}
@@ -174,6 +189,7 @@ LATEST RETRIEVED CONTEXT
 {'=' * 50}
 Iteration {iteration} of {MAX_ITERATIONS}:
 Review the search results above.
+{last_iteration_warning}
 - If results are relevant (score > 0.35) and you can answer confidently -> use "final_answer"
 - If results are poor or confidence < {CONFIDENCE_THRESHOLD} -> try a different tool or refined query
 - If this is the last iteration -> either give best answer or escalate
@@ -201,210 +217,276 @@ def parse_json_response(text: str) -> dict:
 
 
 # Agentic Loop
-def run_agentic_loop(
+def process_ticket_generator(
     issue: str,
-    subject: str,
-    company: str,
-    hint_type: str,
-    warning_prefix: str = "",
-) -> dict:
+    subject: str = "",
+    company: str = "None",
+    provider: str = "auto",
+):
     """
-    The core agentic reasoning loop.
+    A unified event generator for processing a support ticket.
+    Primary path: LangGraph StateGraph (when langgraph is installed).
+    Fallback path: hand-written loop (always available).
 
-    Each iteration:
-    1. Build prompt (with search history if not first)
-    2. Call Claude -> get action JSON
-    3. Execute the action (tool call)
-    4. If final_answer -> return result
-    5. If search -> record results, loop again
-    6. If max iterations reached -> escalate
-
-    Args:
-        issue         : Ticket body
-        subject       : Subject line
-        company       : Inferred company
-        hint_type     : Pre-classified request type
-        warning_prefix: PII/security warning to prepend
-
-    Returns:
-        Final output dict with all 5 fields
+    Yields events:
+      - ("status", {"message": "..."})
+      - ("iteration", {"current": int, "max": int})
+      - ("provider", {"name": "claude"|"openai"|"gemini"})
+      - ("confidence", {"score": float, "level": str, "provider_routed_to": str})
+      - ("raw_token", {"text": "..."}) -- Claude's raw JSON thinking stream
+      - ("tool", {"name": "...", "query": "...", "company": "...", "reason": "..."})
+      - ("token", {"text": "..."}) -- simulated token streaming for final response
+      - ("result", final_output_dict)
+      - ("error", {"message": "..."})
     """
-    search_history = []
-    messages = []
+    # Try LangGraph path first
+    try:
+        from langgraph_agent import process_ticket_langgraph, LANGGRAPH_AVAILABLE
+        if LANGGRAPH_AVAILABLE:
+            yield from process_ticket_langgraph(issue, subject, company, provider)
+            return
+    except Exception as lg_err:
+        print(f"[agent.py] LangGraph path failed ({lg_err}), using fallback loop.", file=sys.stderr)
 
-    for iteration in range(1, MAX_ITERATIONS + 1):
+    # ── Fallback: hand-written loop ──────────────────────────────────────────
+    try:
+        # Pre-check 0: Greetings & Gratitude
+        from classifier import check_greetings_and_gratitude
+        special_res = check_greetings_and_gratitude(issue, subject)
+        if special_res:
+            yield "result", validate_and_fix_output(special_res)
+            return
 
-        #  Build prompt for this iteration 
-        if iteration == 1:
-            user_prompt = build_initial_prompt(issue, subject, company, hint_type)
-        else:
-            user_prompt = build_iteration_prompt(
-                issue, subject, company, iteration, search_history
-            )
+        # Pre-check 1: Guardrails input scan
+        yield "status", {"message": "Analyzing your request..."}
+        guard_result, warning_prefix = full_scan(issue, subject)
+        if guard_result.action == "block":
+            yield "result", validate_and_fix_output(get_input_block_response(guard_result))
+            return
 
-        #  Call Claude with Streaming 
-        # Why stream here?
-        # 1. User sees tokens appear immediately (TTFT ~0.3s vs 10s)
-        # 2. We can display thinking in real time
-        # 3. Still collect full response for JSON parsing
-        # 4. Can cancel early if needed in future
-        messages.append({"role": "user", "content": user_prompt})
+        if guard_result.action == "escalate":
+            yield "result", validate_and_fix_output({
+                "status": "escalated",
+                "product_area": "security",
+                "response": (
+                    warning_prefix +
+                    "Your ticket has been flagged for security review. "
+                    "A human agent will follow up shortly."
+                ),
+                "justification": f"Guardrail: {guard_result.violations[0][:80]}",
+                "request_type": "product_issue",
+            })
+            return
 
-        try:
-            raw = ""  # will collect full streamed response
+        # Pre-check 2: Out of scope
+        from classifier import is_out_of_scope
+        out_of_scope, oos_reason = is_out_of_scope(issue, subject)
+        if out_of_scope:
+            yield "result", validate_and_fix_output({
+                "status": "replied",
+                "product_area": "general",
+                "response": "I'm sorry, this request is outside the scope of my support capabilities. I can help with HackerRank, Claude, and Visa support topics.",
+                "justification": f"Out of scope: {oos_reason}",
+                "request_type": "invalid",
+            })
+            return
 
-            # Show iteration context
-            print(f"\n  Iteration {iteration}/{MAX_ITERATIONS} - streaming response:", flush=True)
-            print(f"  ", end="", flush=True)
+        # Pre-check 3: Hard escalation rules
+        from classifier import should_escalate, get_escalation_request_type
+        escalate, escalation_reason = should_escalate(issue, subject)
+        if escalate:
+            yield "result", validate_and_fix_output({
+                "status": "escalated",
+                "product_area": "escalation",
+                "response": "This issue requires immediate attention from our support team. "
+                           "A human agent will contact you shortly.",
+                "justification": f"Auto-escalated: {escalation_reason}",
+                "request_type": get_escalation_request_type(issue, subject),
+            })
+            return
 
-            # stream=True returns tokens one by one
-            with claude.messages.stream(
-                model=GENERATION_MODEL,
-                max_tokens=1024,
-                system=SYSTEM_PROMPT,
-                messages=messages,
-            ) as stream:
-                for token in stream.text_stream:
-                    # Print each token as it arrives
-                    # end="" prevents newline, flush=True sends immediately
-                    print(token, end="", flush=True)
-                    raw += token  # collect into full string
+        # Enrich
+        inferred_company = infer_company(issue, subject, company)
+        hint_type = classify_request_type(issue, subject)
 
-                # get_final_message() waits for stream to finish
-                # and returns complete message with usage stats
-                final_message = stream.get_final_message()
+        # Layer 3: Pre-generation confidence score
+        confidence = pre_generation_confidence_score(issue, subject)
+        yield "confidence", {
+            "score": confidence["score"],
+            "level": confidence["level"],
+            "provider_routed_to": provider,
+        }
 
-            print()  # newline after streaming completes
+        # Layer 4: Provider routing gate (may upgrade provider for low-confidence tickets)
+        routed_provider = get_routed_provider(confidence, provider)
 
-            # Log token usage - important for cost tracking
-            usage = final_message.usage
-            print(
-                f"  Tokens: input={usage.input_tokens} "
-                f"output={usage.output_tokens} "
-                f"total={usage.input_tokens + usage.output_tokens}",
-                flush=True,
-            )
+        yield "status", {"message": f"Detected: {inferred_company} | {hint_type} | provider={routed_provider}"}
 
-            # Record in cost tracker
-            tracker.record_iteration(
-                ticket_idx=id(issue),  # use issue id as ticket key
-                input_tokens=usage.input_tokens,
-                output_tokens=usage.output_tokens,
-            )
+        # Build router
+        router = LLMRouter(provider=routed_provider)
+
+        # Agentic Loop
+        search_history = []
+        messages = []
+
+        for iteration in range(1, MAX_ITERATIONS + 1):
+            yield "iteration", {"current": iteration, "max": MAX_ITERATIONS}
+            yield "status", {"message": f"Thinking... (iteration {iteration}/{MAX_ITERATIONS})"}
+
+            # Build prompt
+            if iteration == 1:
+                user_prompt = build_initial_prompt(issue, subject, inferred_company, hint_type)
+            else:
+                user_prompt = build_iteration_prompt(
+                    issue, subject, inferred_company, iteration, search_history
+                )
+
+            messages.append({"role": "user", "content": user_prompt})
+
+            raw = ""
+            # Stream tokens via LLMRouter (multi-provider)
+            for token, used_provider in router.stream(messages, system=SYSTEM_PROMPT):
+                if token == "__PROVIDER__":
+                    yield "provider", {"name": used_provider}
+                    continue
+                raw += token
+                yield "raw_token", {"text": token}
+
+            # Cost tracking (Claude-specific — others approximate)
+            try:
+                tracker.record_iteration(
+                    ticket_idx=id(issue),
+                    input_tokens=len(raw) // 4,   # Rough estimate for non-Claude
+                    output_tokens=len(raw) // 4,
+                )
+            except Exception:
+                pass
 
             messages.append({"role": "assistant", "content": raw})
             action = parse_json_response(raw)
+            action_type = action.get("action", "")
 
-        except Exception as e:
-            # Claude API error - safe fallback
-            return validate_and_fix_output({
-                "status": "escalated",
-                "product_area": "general",
-                "response": "We encountered an issue processing your request. A support agent will follow up.",
-                "justification": f"Agent error on iteration {iteration}: {str(e)[:100]}",
-                "request_type": hint_type,
-            })
+            # Final Answer
+            if action_type == "final_answer":
+                confidence = action.get("confidence", 5)
 
-        #  Handle action 
-        action_type = action.get("action", "")
+                if confidence < CONFIDENCE_THRESHOLD and iteration == MAX_ITERATIONS:
+                    action["status"] = "escalated"
+                    action["response"] = (
+                        "This issue requires human review for an accurate answer. "
+                        "A support agent will follow up shortly."
+                    )
+                    action["justification"] = (
+                        f"Low confidence ({confidence}/10) after {iteration} iterations. "
+                        + action.get("justification", "")
+                    )
 
-        # Final answer - agent is done
-        if action_type == "final_answer":
-            confidence = action.get("confidence", 5)
+                if warning_prefix:
+                    action["response"] = warning_prefix + action.get("response", "")
 
-            # Low confidence on final iteration -> escalate
-            if confidence < CONFIDENCE_THRESHOLD and iteration == MAX_ITERATIONS:
-                action["status"] = "escalated"
-                action["response"] = (
-                    "This issue requires human review for an accurate answer. "
-                    "A support agent will follow up shortly."
+                # Apply output guardrails
+                action = apply_output_guardrails(action)
+
+                # Stream response word by word
+                response_text = action.get("response", "")
+                yield "status", {"message": "Generating response..."}
+                words = response_text.split(" ")
+                for i, word in enumerate(words):
+                    yield "token", {"text": word + (" " if i < len(words)-1 else "")}
+
+                yield "result", validate_and_fix_output(action)
+                return
+
+            # Escalate
+            elif action_type == "escalate":
+                yield "result", validate_and_fix_output({
+                    "status": "escalated",
+                    "product_area": "escalation",
+                    "response": (
+                        warning_prefix +
+                        "This issue requires attention from our support team. "
+                        "A human agent will contact you shortly."
+                    ),
+                    "justification": action.get("reason", "Agent escalation decision"),
+                    "request_type": hint_type,
+                })
+                return
+
+            # Out of scope
+            elif action_type == "reply_out_of_scope":
+                yield "result", validate_and_fix_output({
+                    "status": "replied",
+                    "product_area": "general",
+                    "response": (
+                        "I'm sorry, this request is outside the scope of my support capabilities. "
+                        "I can help with HackerRank, Claude, and Visa support topics."
+                    ),
+                    "justification": action.get("reason", "Out of scope"),
+                    "request_type": "invalid",
+                })
+                return
+
+            # Search actions
+            elif action_type in ("search_company_docs", "search_all_docs", "search_refined"):
+                query = action.get("query", issue)
+                tool_company = action.get("company", inferred_company)
+
+                yield "tool", {
+                    "name": action_type,
+                    "query": query,
+                    "company": str(tool_company),
+                    "reason": action.get("reason", ""),
+                }
+                yield "status", {"message": f"Searching: {query[:50]}..."}
+
+                tool_result = execute_tool(
+                    tool_name=action_type,
+                    query=query,
+                    company=tool_company,
                 )
-                action["justification"] = (
-                    f"Low confidence ({confidence}/10) after {iteration} iterations. "
-                    + action.get("justification", "")
-                )
 
-            # Add warning prefix if PII was detected
-            if warning_prefix:
-                action["response"] = warning_prefix + action.get("response", "")
+                search_history.append({
+                    "tool": action_type,
+                    "query": query,
+                    "best_score": tool_result.best_score,
+                    "is_relevant": tool_result.is_relevant(),
+                    "context": tool_result.context[:300] if tool_result.context else "",
+                    "full_context": tool_result.context,
+                })
 
-            return validate_and_fix_output(action)
+                yield "status", {
+                    "message": f"Found {len(tool_result.content)} chunks (relevance: {tool_result.best_score:.2f})"
+                }
 
-        # Escalate - agent decided to hand off
-        elif action_type == "escalate":
-            return validate_and_fix_output({
-                "status": "escalated",
-                "product_area": "escalation",
-                "response": (
-                    warning_prefix +
-                    "This issue requires attention from our support team. "
-                    "A human agent will contact you shortly."
-                ),
-                "justification": action.get("reason", "Agent escalation decision"),
-                "request_type": hint_type,
-            })
+            else:
+                # Unknown action
+                yield "result", validate_and_fix_output({
+                    "status": "escalated",
+                    "product_area": "general",
+                    "response": "Unable to process this request. A support agent will follow up.",
+                    "justification": f"Unknown action '{action_type}' from agent",
+                    "request_type": hint_type,
+                })
+                return
 
-        # Out of scope
-        elif action_type == "reply_out_of_scope":
-            return validate_and_fix_output({
-                "status": "replied",
-                "product_area": "general",
-                "response": (
-                    "I'm sorry, this request is outside the scope of my support capabilities. "
-                    "I can help with HackerRank, Claude, and Visa support topics."
-                ),
-                "justification": action.get("reason", "Out of scope"),
-                "request_type": "invalid",
-            })
+        # Max iterations reached without final_answer
+        yield "result", validate_and_fix_output({
+            "status": "escalated",
+            "product_area": search_history[-1]["tool"] if search_history else "general",
+            "response": (
+                "After thorough review, this issue requires human expertise. "
+                "A support agent will contact you shortly."
+            ),
+            "justification": (
+                f"Escalated after {MAX_ITERATIONS} iterations. "
+                f"Best retrieval score: {max(h['best_score'] for h in search_history):.3f}"
+                if search_history else "No relevant documentation found."
+            ),
+            "request_type": hint_type,
+        })
 
-        # Search action - execute tool and record results
-        elif action_type in ("search_company_docs", "search_all_docs", "search_refined"):
-            query = action.get("query", issue)
-            tool_company = action.get("company", company)
-
-            tool_result: ToolResult = execute_tool(
-                tool_name=action_type,
-                query=query,
-                company=tool_company,
-            )
-
-            # Record this search in history
-            search_history.append({
-                "tool": action_type,
-                "query": query,
-                "best_score": tool_result.best_score,
-                "is_relevant": tool_result.is_relevant(),
-                "context": tool_result.context[:300] if tool_result.context else "",
-                "full_context": tool_result.context,
-            })
-
-        else:
-            # Unknown action - treat as escalation
-            return validate_and_fix_output({
-                "status": "escalated",
-                "product_area": "general",
-                "response": "Unable to process this request. A support agent will follow up.",
-                "justification": f"Unknown action '{action_type}' from agent",
-                "request_type": hint_type,
-            })
-
-    #  Max iterations reached without final_answer 
-    # This means agent kept searching but never got confident enough
-    # Best safe action: escalate
-    return validate_and_fix_output({
-        "status": "escalated",
-        "product_area": search_history[-1]["tool"] if search_history else "general",
-        "response": (
-            "After thorough review, this issue requires human expertise. "
-            "A support agent will contact you shortly."
-        ),
-        "justification": (
-            f"Escalated after {MAX_ITERATIONS} iterations. "
-            f"Best retrieval score: {max(h['best_score'] for h in search_history):.3f}"
-            if search_history else "No relevant documentation found."
-        ),
-        "request_type": hint_type,
-    })
+    except Exception as e:
+        yield "error", {"message": str(e)}
 
 
 # Main Entry Point
@@ -414,86 +496,24 @@ def process_ticket(
     company: str = "None",
 ) -> dict:
     """
-    Full agentic pipeline for one support ticket.
-
-    Pre-checks (no LLM):
-        1. Guardrails input scan
-        2. Out-of-scope check
-        3. Hard escalation rules
-
-    Agentic loop (with LLM):
-        4. Claude reasons, picks tools, searches, reflects
-        5. Max 3 iterations
-        6. Output guardrails
-
-    Args:
-        issue   : Ticket body
-        subject : Subject line
-        company : Company from CSV
-
-    Returns:
-        Dict with status, product_area, response,
-        justification, request_type
+    Original non-streaming API, consumes the generator and returns final result.
+    Tracks and prints execution details to preserve CLI output styles.
     """
-
-    #  Pre-check 1: Guardrails 
-    guard_result, warning_prefix = full_scan(issue, subject)
-
-    if guard_result.action == "block":
-        return validate_and_fix_output(get_input_block_response(guard_result))
-
-    if guard_result.action == "escalate":
-        return validate_and_fix_output({
-            "status": "escalated",
-            "product_area": "security",
-            "response": (
-                warning_prefix +
-                "Your ticket has been flagged for security review. "
-                "A human agent will follow up shortly."
-            ),
-            "justification": f"Guardrail: {guard_result.violations[0][:80]}",
-            "request_type": "product_issue",
-        })
-
-    #  Pre-check 2: Out of scope 
-    from classifier import is_out_of_scope, get_escalation_request_type
-    out_of_scope, oos_reason = is_out_of_scope(issue, subject)
-    if out_of_scope:
-        return validate_and_fix_output({
-            "status": "replied",
-            "product_area": "general",
-            "response": "I'm sorry, this request is outside the scope of my support capabilities.",
-            "justification": f"Out of scope: {oos_reason}",
-            "request_type": "invalid",
-        })
-
-    #  Pre-check 3: Hard escalation rules 
-    escalate, escalation_reason = should_escalate(issue, subject)
-    if escalate:
-        return validate_and_fix_output({
-            "status": "escalated",
-            "product_area": "escalation",
-            "response": "This issue requires immediate attention from our support team. "
-                       "A human agent will contact you shortly.",
-            "justification": f"Auto-escalated: {escalation_reason}",
-            "request_type": get_escalation_request_type(issue, subject),
-        })
-
-    #  Enrich 
-    inferred_company = infer_company(issue, subject, company)
-    hint_type = classify_request_type(issue, subject)
-
-    #  Agentic Loop 
-    result = run_agentic_loop(
-        issue=issue,
-        subject=subject,
-        company=inferred_company,
-        hint_type=hint_type,
-        warning_prefix=warning_prefix,
-    )
-
-    #  Output guardrails 
-    return apply_output_guardrails(result)
+    final_result = {}
+    for event_type, data in process_ticket_generator(issue, subject, company):
+        if event_type == "iteration":
+            print(f"\n  Iteration {data['current']}/{data['max']} - streaming response:")
+            print("  ", end="", flush=True)
+        elif event_type == "raw_token":
+            print(data['text'], end="", flush=True)
+        elif event_type == "result":
+            final_result = data
+        elif event_type == "error":
+            raise RuntimeError(data['message'])
+    if final_result:
+        # Print tokens newline and count info
+        print()
+    return final_result
 
 
 # Quick Test

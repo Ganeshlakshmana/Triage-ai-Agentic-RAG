@@ -226,13 +226,19 @@ def search(
         )
 
     # Execute the search
-    results = client.query_points(
-        collection_name=COLLECTION_NAME,
-        query=query_vector,
-        limit=top_k,
-        query_filter=search_filter,
-        with_payload=True,
-    ).points
+    try:
+        results = client.query_points(
+            collection_name=COLLECTION_NAME,
+            query=query_vector,
+            limit=top_k,
+            query_filter=search_filter,
+            with_payload=True,
+        ).points
+    except Exception as e:
+        import sys
+        print(f"\n[CRITICAL ERROR] Failed to query Qdrant: {e}", file=sys.stderr)
+        print("[HELP] Make sure Qdrant is running in Docker: docker run -d -p 6333:6333 qdrant/qdrant", file=sys.stderr)
+        raise RuntimeError(f"Qdrant connection failed: {e}") from e
 
     # Format results into clean dicts
     formatted = []

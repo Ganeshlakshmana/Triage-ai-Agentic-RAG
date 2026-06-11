@@ -44,7 +44,7 @@ HIGH_RISK_PATTERNS = [
     r"(hacked|compromised|unauthorized\s*access)",
     r"(data\s*breach|data\s*leak|leaked)",
     r"(fraud|fraudulent|scam|phishing)",
-    r"(stolen|lost)\s*(card|account|credentials|password)",
+    r"(stolen|lost)\s*(account|credentials|password)",
     r"(legal|lawsuit|court|attorney|lawyer)",
     r"(all\s*pages?|everything)\s*(is\s*)?(down|broken|not\s*working)",
     r"emergency|urgent\s*security",
@@ -54,7 +54,6 @@ HIGH_RISK_PATTERNS = [
 # Patterns that suggest the ticket is out of scope / invalid
 OUT_OF_SCOPE_PATTERNS = [
     r"^(hi|hello|hey|thanks|thank you|ok|okay|yes|no|sure)[\s.!]*$",
-    r"^(what is|who is|when was|where is)\s+\w+",  # general knowledge questions
     r"(weather|stock\s*price|sports|movie|recipe|joke)",
     r"(iron\s*man|marvel|disney|netflix|game\s*of\s*thrones)",
 ]
@@ -129,6 +128,46 @@ def is_out_of_scope(issue: str, subject: str = "") -> tuple[bool, str]:
             return True, f"Out-of-scope pattern matched: '{pattern}'"
 
     return False, ""
+
+
+def check_greetings_and_gratitude(issue: str, subject: str = "") -> dict | None:
+    """
+    Check if a ticket is purely a greeting or gratitude.
+    Returns: Dict with output fields if it is, or None if not.
+    """
+    combined = f"{subject} {issue}".lower().strip()
+    issue_clean = issue.strip().lower()
+
+    # Remove trailing punctuation and spaces
+    issue_clean = re.sub(r"[^\w\s]", "", issue_clean).strip()
+
+    # Gratitude
+    thanks_words = ["thank you", "thanks", "thankyou", "thx", "appreciate it", "grateful"]
+    for word in thanks_words:
+        if issue_clean == word or issue_clean.startswith(word + " ") or issue_clean.endswith(" " + word):
+            if len(issue_clean) < 40:
+                return {
+                    "status": "replied",
+                    "product_area": "general",
+                    "response": "Happy to help!",
+                    "justification": "Acknowledged gratitude",
+                    "request_type": "invalid",
+                }
+
+    # Greetings
+    greetings = ["hi", "hello", "hey", "good morning", "good afternoon", "good evening", "hi there", "hello there"]
+    for word in greetings:
+        if issue_clean == word or issue_clean == word + " there":
+            if len(issue_clean) < 30:
+                return {
+                    "status": "replied",
+                    "product_area": "general",
+                    "response": "Hello! I can help you with support questions related to HackerRank, Claude, or Visa. How can I assist you today?",
+                    "justification": "Acknowledged greeting",
+                    "request_type": "invalid",
+                }
+                
+    return None
 
 
 # Request Type Classification
