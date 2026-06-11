@@ -3,24 +3,51 @@
 # ─────────────────────────────────────────────
 # Install all dependencies with:
 #   pip install -r requirements.txt
-#
-# Why pin versions? (e.g. google-generativeai==0.8.3)
-# Pinning ensures everyone uses the SAME version.
-# Unpinned packages can silently break when a new version releases.
 # ─────────────────────────────────────────────
 
 
-# ── LLM & Embeddings ──────────────────────────
-google-genai>=0.8.0
-# Google's official SDK for Gemini models.
-# Used for both embeddings (text-embedding-004)
-# and generation (gemini-2.0-flash)
-
-sentence-transformers>=2.7.0
+# ── LLM Providers ─────────────────────────────
 anthropic>=0.25.0
-fastapi 
-uvicorn 
+# Anthropic Claude SDK — primary LLM provider.
+
+openai>=1.30.0
+# OpenAI SDK — secondary LLM provider (gpt-4o-mini).
+# Used in multi-provider routing fallback chain.
+
+google-genai>=0.8.0
+# Google Gemini SDK — tertiary LLM provider (gemini-2.0-flash).
+# Used in multi-provider routing fallback chain.
+
+
+# ── LangChain / LangGraph ─────────────────────
+langgraph>=0.2.0
+# LangGraph StateGraph for structured agentic pipelines.
+# Replaces hand-written loop with a typed state machine.
+
+langchain>=0.2.0
+# LangChain core — prompt templates, message types, runnable protocol.
+
+langchain-anthropic>=0.2.0
+# LangChain adapter for Anthropic Claude.
+
+langchain-openai>=0.1.0
+# LangChain adapter for OpenAI.
+
+langchain-google-genai>=1.0.0
+# LangChain adapter for Google Gemini.
+
+
+# ── Embeddings ────────────────────────────────
+sentence-transformers>=2.7.0
+# Local embedding model (all-MiniLM-L6-v2).
+# Runs entirely on-device — no API calls, no rate limits.
+
+
+# ── API & Server ──────────────────────────────
+fastapi
+uvicorn
 python-multipart
+
 
 # ── Vector Database ───────────────────────────
 qdrant-client>=1.9.0
@@ -30,30 +57,13 @@ qdrant-client>=1.9.0
 
 # ── Environment & Config ──────────────────────
 python-dotenv>=1.0.0
-# Reads .env file and loads variables into os.environ.
-# Keeps API keys out of source code.
 
 
 # ── Data Handling ─────────────────────────────
 pandas>=2.0.0
-# Reading/writing CSV files cleanly.
-# Used in main.py to process support_tickets.csv
-
 tqdm>=4.66.0
-# Progress bars in the terminal.
-# Shows ingestion progress: "Embedding chunk 142/500..."
-# Small detail but important for long-running jobs.
-
-
-# ── Text Processing ───────────────────────────
 tiktoken>=0.7.0
-# Token counter from OpenAI (works for counting purposes).
-# Helps us know exactly how many tokens we're sending to Gemini.
-# Why? Gemini has token limits — we need to stay within them.
 
 
 # ── Async Support ─────────────────────────────
 asyncio-throttle>=1.0.2
-# Rate limiting for async API calls.
-# Gemini API has rate limits (requests per minute).
-# This prevents us from hitting those limits when processing many tickets.

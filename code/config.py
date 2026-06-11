@@ -16,9 +16,15 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-# API Keys
+# API Keys — Multi-Provider
 ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
-# Used for Claude generation (claude-sonnet-4-5)
+# Primary provider: Claude (claude-sonnet-4-5)
+
+OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
+# Secondary provider: OpenAI (gpt-4o-mini)
+
+GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
+# Tertiary provider: Google Gemini (gemini-2.0-flash)
 
 
 # Embedding Model - runs LOCALLY, no API needed
@@ -33,10 +39,18 @@ EMBEDDING_DIMENSION: int = 384
 # Must match what we tell Qdrant when creating the collection.
 
 
-# Generation Model - Claude API
-GENERATION_MODEL: str = "claude-sonnet-4-5"
-# Used to read retrieved chunks + ticket and generate response.
-# Fast, capable, cost-efficient for support ticket use case.
+# Generation Models — per provider
+GENERATION_MODEL: str = "claude-sonnet-4-5"        # Claude default
+OPENAI_MODEL: str = "gpt-4o-mini"                   # OpenAI default
+GEMINI_MODEL: str = "gemini-2.0-flash"              # Gemini default
+
+# Multi-Provider Routing
+DEFAULT_PROVIDER: str = os.getenv("DEFAULT_PROVIDER", "auto")
+# "auto" = try Claude → OpenAI → Gemini in fallback order.
+# Override to "claude", "openai", or "gemini" for a fixed provider.
+
+PROVIDER_FALLBACK_CHAIN: list = ["claude", "openai", "gemini"]
+# Order in which providers are attempted when DEFAULT_PROVIDER="auto".
 
 
 # Qdrant Vector Database Connection
@@ -122,8 +136,12 @@ def validate_config() -> None:
     """
     errors = []
 
-    if not ANTHROPIC_API_KEY:
-        errors.append("ANTHROPIC_API_KEY is not set. Add it to your .env file.")
+    # At least one LLM provider key must be set
+    if not any([ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY]):
+        errors.append(
+            "No LLM provider API key found. Set at least one of: "
+            "ANTHROPIC_API_KEY, OPENAI_API_KEY, or GEMINI_API_KEY in your .env file."
+        )
 
     if not DATA_DIR.exists():
         errors.append(f"Data directory not found: {DATA_DIR}")
