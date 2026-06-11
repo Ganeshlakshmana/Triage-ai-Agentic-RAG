@@ -1,12 +1,12 @@
 {
-  "name": "frontend",
+  "name": "triageai-frontend",
   "private": true,
-  "version": "0.0.0",
+  "version": "1.0.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "vite build",
-    "lint": "eslint .",
+    "build": "tsc && vite build",
+    "lint": "eslint . --ext ts,tsx",
     "preview": "vite preview"
   },
   "dependencies": {
@@ -26,6 +26,7 @@
     "globals": "^17.5.0",
     "postcss": "^8.5.13",
     "tailwindcss": "^4.2.4",
+    "typescript": "^5.9.3",
     "vite": "^8.0.10"
   }
 }
